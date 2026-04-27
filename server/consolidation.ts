@@ -1,8 +1,28 @@
-import { query } from "@anthropic-ai/claude-agent-sdk";
+import OpenAI from "openai";
 import { api } from "../convex/_generated/api.js";
 import { convex } from "./convex-client.js";
 import { broadcast } from "./broadcast.js";
-import { aggregateUsageFromResult, EMPTY_USAGE, type UsageTotals } from "./usage.js";
+import type { UsageTotals } from "./usage.js";
+
+const PRICING: Record<string, { input: number; output: number; cached: number }> = {
+  "gpt-4.1":      { input: 2.00,  output: 8.00,  cached: 0.50 },
+  "gpt-4.1-mini": { input: 0.40,  output: 1.60,  cached: 0.10 },
+  "gpt-4o":       { input: 2.50,  output: 10.00, cached: 1.25 },
+  "gpt-4o-mini":  { input: 0.15,  output: 0.60,  cached: 0.075 },
+};
+
+function calcCost(model: string, inputTokens: number, outputTokens: number, cached: number): number {
+  const baseModel = Object.keys(PRICING).find((k) => model.startsWith(k)) ?? model;
+  const p = PRICING[baseModel];
+  if (!p) return 0;
+  return ((Math.max(0, inputTokens - cached) * p.input + outputTokens * p.output + cached * p.cached) / 1_000_000);
+}
+
+let _openai: OpenAI | null = null;
+function getOpenAI(): OpenAI {
+  if (!_openai) _openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  return _openai;
+}
 
 function randomId(prefix: string): string {
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
@@ -97,8 +117,8 @@ interface Challenge {
   severity: "low" | "medium" | "high";
 }
 
-const ADVERSARY_MODEL = process.env.BOOP_ADVERSARY_MODEL ?? "claude-haiku-4-5";
-const DEFAULT_MODEL = process.env.BOOP_MODEL ?? "claude-sonnet-4-6";
+const ADVERSARY_MODEL = process.env.BOOP_ADVERSARY_MODEL ?? "gpt-4o-mini";
+const DEFAULT_MODEL = process.env.BOOP_MODEL ?? "gpt-4.1-mini";
 
 interface Decision {
   proposalIndex: number;
@@ -118,24 +138,28 @@ async function runLlm(
   model: string = DEFAULT_MODEL,
 ): Promise<{ buffer: string; usage: UsageTotals; durationMs: number }> {
   const started = Date.now();
-  let buffer = "";
-  let usage: UsageTotals = { ...EMPTY_USAGE };
-  for await (const msg of query({
-    prompt: userPrompt,
-    options: {
-      systemPrompt,
-      model,
-      permissionMode: "bypassPermissions",
-    },
-  })) {
-    if (msg.type === "assistant") {
-      for (const block of msg.message.content) {
-        if (block.type === "text") buffer += block.text;
-      }
-    } else if (msg.type === "result") {
-      usage = aggregateUsageFromResult(msg, model);
-    }
-  }
+  const resp = await getOpenAI().chat.completions.create({
+    model,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt },
+    ],
+  });
+  const buffer = resp.choices[0]?.message?.content ?? "";
+  const inputTokens = resp.usage?.prompt_tokens ?? 0;
+  const outputTokens = resp.usage?.completion_tokens ?? 0;
+  const cached =
+    (resp.usage as { prompt_tokens_details?: { cached_tokens?: number } })
+      ?.prompt_tokens_details?.cached_tokens ?? 0;
+  const costUsd = calcCost(model, inputTokens, outputTokens, cached);
+  const usage: UsageTotals = {
+    model,
+    inputTokens,
+    outputTokens,
+    cacheReadTokens: cached,
+    cacheCreationTokens: 0,
+    costUsd,
+  };
   return { buffer, usage, durationMs: Date.now() - started };
 }
 

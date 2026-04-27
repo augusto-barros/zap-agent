@@ -137,179 +137,13 @@ function runCapture(cmd: string, args: string[]): Promise<string> {
   });
 }
 
-async function sendblueInvoker(): Promise<{ cmd: string; leading: string[] }> {
-  if (await hasBinary("sendblue")) return { cmd: "sendblue", leading: [] };
-  return { cmd: "npx", leading: ["-y", "@sendblue/cli"] };
-}
-
-interface SendblueKeys {
-  apiKey?: string;
-  apiSecret?: string;
-  fromNumber?: string;
-}
-
-function parseSendblueKeys(output: string): SendblueKeys {
-  const clean = output.replace(/\x1b\[[0-9;]*m/g, "");
-  const keys: SendblueKeys = {};
-
-  try {
-    const json = JSON.parse(clean);
-    if (json.api_key_id || json.apiKeyId) keys.apiKey = json.api_key_id ?? json.apiKeyId;
-    if (json.api_secret_key || json.apiSecretKey)
-      keys.apiSecret = json.api_secret_key ?? json.apiSecretKey;
-    if (json.phone_number || json.phoneNumber)
-      keys.fromNumber = json.phone_number ?? json.phoneNumber;
-    if (keys.apiKey && keys.apiSecret) return keys;
-  } catch {
-    /* not json, fall through to text parsing */
-  }
-
-  const idMatch = clean.match(
-    /(?:API[- ]?Key[- ]?ID|sb[- ]?api[- ]?key[- ]?id|api_key_id|Key Id|API[- ]?Key)[:\s]+\"?([A-Za-z0-9_-]{16,})/i,
-  );
-  const secretMatch = clean.match(
-    /(?:Secret[- ]?Key|API[- ]?Secret|sb[- ]?api[- ]?secret[- ]?key|api_secret|Secret)[:\s]+\"?([A-Za-z0-9_-]{16,})/i,
-  );
-  const numMatch = clean.match(
-    /(?:Phone[- ]?Number|From[- ]?Number|number)[:\s]+\"?(\+?\d{10,15})/i,
-  );
-
-  if (idMatch) keys.apiKey = idMatch[1];
-  if (secretMatch) keys.apiSecret = secretMatch[1];
-  if (numMatch) keys.fromNumber = numMatch[1];
-  return keys;
-}
-
-function parseSendbluePhones(output: string): string[] {
-  const clean = output.replace(/\x1b\[[0-9;]*m/g, "");
-  const seen = new Set<string>();
-  const numbers: string[] = [];
-
-  try {
-    const json = JSON.parse(clean);
-    const lines = Array.isArray(json) ? json : (json.lines ?? json.numbers ?? []);
-    for (const entry of lines) {
-      const n = entry?.phone_number ?? entry?.phoneNumber ?? entry?.number ?? entry;
-      if (typeof n === "string" && /^\+?\d{10,15}$/.test(n.replace(/[^\d+]/g, ""))) {
-        const norm = n.startsWith("+") ? n : `+${n}`;
-        if (!seen.has(norm)) {
-          seen.add(norm);
-          numbers.push(norm);
-        }
-      }
-    }
-    if (numbers.length) return numbers;
-  } catch {
-    /* not JSON, fall through to text parsing */
-  }
-
-  // `sendblue lines` formats like "+1 (305) 336-9541".
-  for (const rawLine of clean.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line.startsWith("+")) continue;
-    const match = line.match(/^\+[\d ()\-.]{9,25}/);
-    if (!match) continue;
-    const e164 = "+" + match[0].replace(/\D/g, "");
-    if (/^\+\d{10,15}$/.test(e164) && !seen.has(e164)) {
-      seen.add(e164);
-      numbers.push(e164);
-    }
-  }
-  return numbers;
-}
-
-async function importSendblueFromCli(): Promise<SendblueKeys | null> {
-  const { method } = await prompts(
-    {
-      type: "select",
-      name: "method",
-      message: "How do you want to configure Sendblue?",
-      choices: [
-        { title: "Use the Sendblue CLI (I'll run it — fastest)", value: "cli" },
-        { title: "Paste my API keys manually", value: "manual" },
-        { title: "Skip for now", value: "skip" },
-      ],
-      initial: 0,
-    },
-    {
-      onCancel: () => {
-        console.log("Setup cancelled.");
-        process.exit(1);
-      },
-    },
-  );
-
-  if (method === "manual") return null;
-  if (method === "skip") return { apiKey: "", apiSecret: "", fromNumber: "" };
-
-  const { account } = await prompts({
-    type: "select",
-    name: "account",
-    message: "Do you already have a Sendblue account?",
-    choices: [
-      { title: "Yes — log in", value: "login" },
-      { title: "No — create one with `sendblue setup`", value: "setup" },
-    ],
-    initial: 0,
-  });
-
-  const { cmd, leading } = await sendblueInvoker();
-
-  banner("Sendblue CLI");
-  try {
-    await runInherit(cmd, [...leading, account === "setup" ? "setup" : "login"]);
-    console.log("\nFetching your Sendblue keys…\n");
-    const output = await runCapture(cmd, [...leading, "show-keys"]);
-    const parsed = parseSendblueKeys(output);
-    if (!parsed.apiKey || !parsed.apiSecret) {
-      console.log(
-        `\nCouldn't auto-parse keys from the CLI output. I'll ask for them below — copy/paste from the output above.`,
-      );
-      return null;
-    }
-    console.log(`\n✓ Pulled your Sendblue keys from the CLI.`);
-
-    // `show-keys` doesn't include the phone number — it lives in `sendblue lines`.
-    if (!parsed.fromNumber) {
-      try {
-        console.log("\nFetching your provisioned number…\n");
-        const linesOutput = await runCapture(cmd, [...leading, "lines"]);
-        const phones = parseSendbluePhones(linesOutput);
-        if (phones.length === 1) {
-          parsed.fromNumber = phones[0];
-          console.log(`\n✓ Using ${phones[0]} as SENDBLUE_FROM_NUMBER.`);
-        } else if (phones.length > 1) {
-          const { pickedNumber } = await prompts({
-            type: "select",
-            name: "pickedNumber",
-            message: "You have multiple Sendblue numbers — which one should Boop reply from?",
-            choices: phones.map((p) => ({ title: p, value: p })),
-            initial: 0,
-          });
-          if (pickedNumber) parsed.fromNumber = pickedNumber;
-        } else {
-          console.log(
-            `\n⚠ No provisioned numbers found in \`sendblue lines\`. I'll ask for one below.`,
-          );
-        }
-      } catch (err) {
-        console.log(`\n⚠ \`sendblue lines\` failed: ${err}. I'll ask for the number below.`);
-      }
-    }
-    return parsed;
-  } catch (err) {
-    console.log(`\n⚠ Sendblue CLI failed: ${err}`);
-    console.log(`Falling back to manual prompts.`);
-    return null;
-  }
-}
 
 async function main() {
   banner("boop-agent setup");
 
   console.log(`
 What this does:
-  1. Pulls your Sendblue keys (via their CLI, or you paste them)
+  1. Asks for your WhatsApp (Meta Cloud API) credentials
   2. Asks about your Claude model preference
   3. Runs \`npx convex dev\` to create a Convex project
   4. Writes .env.local
@@ -317,48 +151,46 @@ What this does:
 Before you start:
   • A Claude Code subscription:    https://claude.com/code
   • Convex account (free tier):    https://convex.dev
-  • Sendblue (free on agent plan): https://sendblue.co
+  • Meta Developer app with WhatsApp: https://developers.facebook.com
 `);
 
   const existing = readEnv(ENV_PATH);
-  const cli = await importSendblueFromCli();
 
-  const sendblueDefaults = {
-    SENDBLUE_API_KEY: cli?.apiKey ?? existing.SENDBLUE_API_KEY ?? "",
-    SENDBLUE_API_SECRET: cli?.apiSecret ?? existing.SENDBLUE_API_SECRET ?? "",
-    SENDBLUE_FROM_NUMBER: cli?.fromNumber ?? existing.SENDBLUE_FROM_NUMBER ?? "",
+  const whatsappDefaults = {
+    WHATSAPP_TOKEN: existing.WHATSAPP_TOKEN ?? "",
+    WHATSAPP_PHONE_NUMBER_ID: existing.WHATSAPP_PHONE_NUMBER_ID ?? "",
+    WHATSAPP_VERIFY_TOKEN: existing.WHATSAPP_VERIFY_TOKEN ?? "boop-webhook",
   };
 
-  const sendbluePrompts = [] as any[];
-  if (!sendblueDefaults.SENDBLUE_API_KEY) {
-    sendbluePrompts.push({
-      type: "text",
-      name: "SENDBLUE_API_KEY",
-      message: "Sendblue API key id (sb-api-key-id value)",
-      initial: "",
-    });
-  }
-  if (!sendblueDefaults.SENDBLUE_API_SECRET) {
-    sendbluePrompts.push({
+  const whatsappPrompts = [] as any[];
+  if (!whatsappDefaults.WHATSAPP_TOKEN) {
+    whatsappPrompts.push({
       type: "password",
-      name: "SENDBLUE_API_SECRET",
-      message: "Sendblue API secret",
+      name: "WHATSAPP_TOKEN",
+      message: "WhatsApp token (Meta Developer Console → WhatsApp → API Setup → Temporary/permanent token)",
       initial: "",
     });
   }
-  if (!sendblueDefaults.SENDBLUE_FROM_NUMBER) {
-    sendbluePrompts.push({
+  if (!whatsappDefaults.WHATSAPP_PHONE_NUMBER_ID) {
+    whatsappPrompts.push({
       type: "text",
-      name: "SENDBLUE_FROM_NUMBER",
-      message:
-        "Your Sendblue-provisioned number (the one people text TO, e.g. +14695551234). Required by Sendblue.",
+      name: "WHATSAPP_PHONE_NUMBER_ID",
+      message: "WhatsApp Phone Number ID (Meta Developer Console → WhatsApp → API Setup)",
       initial: "",
+    });
+  }
+  if (!whatsappDefaults.WHATSAPP_VERIFY_TOKEN) {
+    whatsappPrompts.push({
+      type: "text",
+      name: "WHATSAPP_VERIFY_TOKEN",
+      message: "Webhook verify token (any string you choose — use the same when registering in Meta)",
+      initial: "boop-webhook",
     });
   }
 
   const answers = await prompts(
     [
-      ...sendbluePrompts,
+      ...whatsappPrompts,
       {
         type: "select",
         name: "BOOP_MODEL",
@@ -391,11 +223,11 @@ Before you start:
     },
   );
 
-  // Merge CLI-sourced defaults with what the user answered (answer wins).
+  // Merge defaults with what the user answered (answer wins).
   Object.assign(answers, {
-    SENDBLUE_API_KEY: answers.SENDBLUE_API_KEY ?? sendblueDefaults.SENDBLUE_API_KEY,
-    SENDBLUE_API_SECRET: answers.SENDBLUE_API_SECRET ?? sendblueDefaults.SENDBLUE_API_SECRET,
-    SENDBLUE_FROM_NUMBER: answers.SENDBLUE_FROM_NUMBER ?? sendblueDefaults.SENDBLUE_FROM_NUMBER,
+    WHATSAPP_TOKEN: answers.WHATSAPP_TOKEN ?? whatsappDefaults.WHATSAPP_TOKEN,
+    WHATSAPP_PHONE_NUMBER_ID: answers.WHATSAPP_PHONE_NUMBER_ID ?? whatsappDefaults.WHATSAPP_PHONE_NUMBER_ID,
+    WHATSAPP_VERIFY_TOKEN: answers.WHATSAPP_VERIFY_TOKEN ?? whatsappDefaults.WHATSAPP_VERIFY_TOKEN,
   });
 
   // ---- Composio API key ---------------------------------------------------
@@ -458,10 +290,10 @@ Before you start:
   }
 
   // ---- Tunnel configuration ------------------------------------------------
-  banner("Tunnel — public URL for Sendblue to reach your server");
+  banner("Tunnel — public URL for Meta to reach your server");
   console.log(`
 ngrok's FREE plan gives you a NEW public URL every restart, which means
-re-pasting into Sendblue every time. For a stable URL, pick one of:
+re-pasting into the Meta Developer Console every time. For a stable URL, pick one of:
 
   1. Free ngrok             (fine for testing / demos — re-paste each restart)
   2. ngrok RESERVED domain  (paid — stays the same across restarts)
@@ -569,8 +401,8 @@ Before you start: install ngrok (one-time).
   ngrok config add-authtoken <your-token>      # free at https://dashboard.ngrok.com
 
 ⚠ ngrok's FREE plan gives you a NEW URL every restart. That means
-  re-pasting into Sendblue every time.  For anything beyond a demo,
-  use a stable URL:
+  re-pasting into the Meta Developer Console every time. For anything beyond
+  a demo, use a stable URL:
     • ngrok paid plan (reserved domain), or
     • Cloudflare Tunnel: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/
 
@@ -582,23 +414,18 @@ That starts the server, Convex watcher, debug dashboard, AND ngrok all
 together — color-prefixed output so you can tell who's saying what. Once
 the tunnel is live, you'll see a banner with your public URL.
 
-Wire up Sendblue (one-time, takes ~30 seconds):
+Wire up WhatsApp webhook (one-time, takes ~2 minutes):
 
-  1. Copy the "Sendblue webhook" URL printed by ngrok.
-  2. Sendblue dashboard → API Settings → Webhook Configuration
-  3. Add it as an INBOUND MESSAGE webhook.
-  4. Paste the URL. Save.
+  1. Copy the "WhatsApp webhook" URL printed in the banner.
+  2. Meta Developer Console → your app → WhatsApp → Configuration
+  3. Under Webhook, click Edit.
+  4. Paste the URL as "Callback URL" and use your WHATSAPP_VERIFY_TOKEN as "Verify token".
+  5. Click Verify and Save. Then subscribe to the "messages" field.
 
 Test it:
   • Open http://localhost:5173 for the debug dashboard (Chat tab works
-    without Sendblue).
-  • Or text your Sendblue number from a different phone. The agent replies.
-
-Gotcha to double-check:
-  SENDBLUE_FROM_NUMBER in .env.local must be your Sendblue-provisioned
-  number (the one people text TO), NOT your personal cell. Sendblue
-  rejects sends with "Cannot send messages to self" or "missing required
-  parameter: from_number" otherwise.
+    without WhatsApp configured).
+  • Or text your WhatsApp Business number. The agent replies.
 
 Integrations (via Composio):
   1. Set COMPOSIO_API_KEY in .env.local (get one at https://app.composio.dev/developers?utm_source=chris&utm_medium=youtube&utm_campaign=collab).

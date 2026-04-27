@@ -1,11 +1,12 @@
-import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { AgentMessage } from "./agent-runtime.js";
 
 export interface UsageTotals {
-  /** Name of the model that consumed the most tokens. */
   model: string;
   inputTokens: number;
   outputTokens: number;
+  /** Prompt tokens served from cache (OpenAI cached_tokens). */
   cacheReadTokens: number;
+  /** Always 0 for OpenAI (Anthropic-specific concept, kept for DB compat). */
   cacheCreationTokens: number;
   costUsd: number;
 }
@@ -19,79 +20,56 @@ export const EMPTY_USAGE: UsageTotals = {
   costUsd: 0,
 };
 
-/**
- * The SDK's result message has two cost-y fields:
- *   - msg.usage      → raw Anthropic usage for the FINAL turn only (snake_case)
- *   - msg.modelUsage → aggregate per-model across the whole query (camelCase)
- *
- * Always prefer modelUsage — msg.usage massively undercounts on tool-heavy runs.
- *
- * Note on the `model` field returned: msg.modelUsage can contain MULTIPLE models
- * per query because Claude Code CLI uses different models for different internal
- * sub-tasks within a single query() call (e.g. haiku for cheap routing + sonnet
- * for the main response). If you pass `requestedModel`, it's used as the reported
- * primary so the cost row reflects what the caller actually asked for. Otherwise
- * we fall back to whichever model consumed the most tokens — accurate by volume
- * but often misleading.
- */
-export function aggregateUsageFromResult(
-  msg: Extract<SDKMessage, { type: "result" }>,
-  requestedModel?: string,
-): UsageTotals {
-  const modelUsage = (msg as { modelUsage?: Record<string, {
-    inputTokens?: number;
-    outputTokens?: number;
-    cacheReadInputTokens?: number;
-    cacheCreationInputTokens?: number;
-  }> }).modelUsage ?? {};
+// ---- Pricing table (USD per 1M tokens) -------------------------------------
+// Update when OpenAI changes pricing.
+const PRICING: Record<string, { input: number; output: number; cached: number }> = {
+  "gpt-4.1":      { input: 2.00,  output: 8.00,  cached: 0.50 },
+  "gpt-4.1-mini": { input: 0.40,  output: 1.60,  cached: 0.10 },
+  "gpt-4.1-nano": { input: 0.10,  output: 0.40,  cached: 0.025 },
+  "gpt-4o":       { input: 2.50,  output: 10.00, cached: 1.25 },
+  "gpt-4o-mini":  { input: 0.15,  output: 0.60,  cached: 0.075 },
+};
 
-  let inputTokens = 0;
-  let outputTokens = 0;
-  let cacheReadTokens = 0;
-  let cacheCreationTokens = 0;
-  let fallbackModel = "";
-  let fallbackTotal = 0;
-
-  for (const [model, u] of Object.entries(modelUsage)) {
-    const inT = u.inputTokens ?? 0;
-    const outT = u.outputTokens ?? 0;
-    inputTokens += inT;
-    outputTokens += outT;
-    cacheReadTokens += u.cacheReadInputTokens ?? 0;
-    cacheCreationTokens += u.cacheCreationInputTokens ?? 0;
-    const total = inT + outT;
-    if (total > fallbackTotal) {
-      fallbackTotal = total;
-      fallbackModel = model;
-    }
-  }
-
-  // Prefer the requested model if the SDK confirmed usage for it; fall back to
-  // the heaviest-usage model only if the caller didn't pass one or the SDK
-  // routed entirely around it (rare).
-  let reportedModel: string;
-  if (requestedModel && matchesAnyKey(requestedModel, Object.keys(modelUsage))) {
-    reportedModel = requestedModel;
-  } else {
-    reportedModel = fallbackModel || requestedModel || "unknown";
-  }
-
-  return {
-    model: reportedModel,
-    inputTokens,
-    outputTokens,
-    cacheReadTokens,
-    cacheCreationTokens,
-    costUsd: msg.total_cost_usd ?? 0,
-  };
+function calcCost(
+  model: string,
+  inputTokens: number,
+  outputTokens: number,
+  cachedTokens: number,
+): number {
+  // Strip date suffixes like "gpt-4.1-mini-2025-04-14"
+  const baseModel = Object.keys(PRICING).find((k) => model.startsWith(k)) ?? model;
+  const p = PRICING[baseModel];
+  if (!p) return 0;
+  const uncachedInput = Math.max(0, inputTokens - cachedTokens);
+  return (
+    (uncachedInput * p.input + outputTokens * p.output + cachedTokens * p.cached) /
+    1_000_000
+  );
 }
 
-function matchesAnyKey(requested: string, keys: string[]): boolean {
-  if (keys.includes(requested)) return true;
-  // SDK may expand a short alias like "claude-sonnet-4-6" to a date-stamped
-  // full id like "claude-sonnet-4-6-20251101" in modelUsage keys. Prefix match
-  // covers both directions.
-  return keys.some(
-    (k) => k === requested || k.startsWith(requested) || requested.startsWith(k),
-  );
+// ---- Aggregate from our agent-runtime result event ------------------------
+
+export function aggregateUsageFromResult(
+  msg: Extract<AgentMessage, { type: "result" }>,
+  requestedModel?: string,
+): UsageTotals {
+  const usage = msg._usage;
+  const model = requestedModel ?? msg._model ?? "unknown";
+
+  if (!usage) return { ...EMPTY_USAGE, model };
+
+  const inputTokens = usage.prompt_tokens ?? 0;
+  const outputTokens = usage.completion_tokens ?? 0;
+  const cachedTokens =
+    (usage as { prompt_tokens_details?: { cached_tokens?: number } })
+      .prompt_tokens_details?.cached_tokens ?? 0;
+
+  return {
+    model,
+    inputTokens,
+    outputTokens,
+    cacheReadTokens: cachedTokens,
+    cacheCreationTokens: 0,
+    costUsd: calcCost(model, inputTokens, outputTokens, cachedTokens),
+  };
 }

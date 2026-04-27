@@ -1,10 +1,10 @@
-import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
+import type { ToolServer } from "../agent-runtime.js";
 
 export interface IntegrationModule {
   name: string;
   description: string;
   requiredEnv?: string[];
-  createServer: (ctx: IntegrationContext) => Promise<McpSdkServerConfigWithInstance>;
+  createServer: (ctx: IntegrationContext) => Promise<ToolServer>;
 }
 
 export interface IntegrationContext {
@@ -46,9 +46,9 @@ export function makeContext(conversationId?: string): IntegrationContext {
 export async function buildMcpServersForIntegrations(
   names: string[],
   conversationId?: string,
-): Promise<Record<string, McpSdkServerConfigWithInstance>> {
+): Promise<Record<string, ToolServer>> {
   const ctx = makeContext(conversationId);
-  const out: Record<string, McpSdkServerConfigWithInstance> = {};
+  const out: Record<string, ToolServer> = {};
   for (const name of names) {
     const mod = registry.get(name);
     if (!mod) {

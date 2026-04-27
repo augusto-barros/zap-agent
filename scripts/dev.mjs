@@ -137,24 +137,15 @@ async function waitForNgrokUrl(timeoutMs = 15000) {
 
 function showBanner(url, stable) {
   const line = "═".repeat(68);
-  const webhook = `${url}/sendblue/webhook`;
+  const webhook = `${url}/whatsapp/webhook`;
   const dashboard = `http://localhost:5173`;
-  const from = envVars.SENDBLUE_FROM_NUMBER;
-  const fromLine = from
-    ? `  📱 Text this Sendblue number:  ${from}  (from a DIFFERENT phone)`
-    : `  ⚠ SENDBLUE_FROM_NUMBER is not set — outbound sends will fail.\n     Run: npm run sendblue:sync   (pulls it from the Sendblue CLI)`;
 
   const headline = stable
     ? `your STABLE public URL is live.`
-    : `ngrok tunnel is live  (webhook auto-registered with Sendblue).`;
-  const footer = stable
-    ? ``
-    : `\n${C.dim}  ℹ The inbound webhook above was registered with Sendblue automatically.
-    Set SENDBLUE_AUTO_WEBHOOK=false in .env.local to disable, or pick a
-    stable URL (ngrok paid / Cloudflare Tunnel) via \`npm run setup\`.${C.reset}\n`;
+    : `ngrok tunnel is live.`;
   const guide = stable
-    ? `\n  → First time? Sendblue dashboard → API Settings → Webhook\n    Configuration → add ${webhook} as INBOUND MESSAGE.\n`
-    : ``;
+    ? ``
+    : `\n${C.dim}  ℹ Register ${webhook} in the Meta Developer Console:\n    App → WhatsApp → Configuration → Webhook → Callback URL.${C.reset}\n`;
 
   console.log(`
 ${C.banner}${line}
@@ -162,9 +153,9 @@ ${C.banner}${line}
 
   🐶 Debug dashboard (click me):   ${dashboard}
   🌐 Public URL:                   ${url}
-  📮 Sendblue webhook (inbound):   ${webhook}
-${fromLine}${guide}
-${line}${C.reset}${footer}`);
+  📲 WhatsApp webhook (inbound):   ${webhook}
+${guide}
+${line}${C.reset}`);
 }
 
 // --- main ---------------------------------------------------------------
@@ -179,7 +170,7 @@ ${C.dim}  Install:   brew install ngrok         (macOS)
   Auth:      ngrok config add-authtoken <token>
              (free token at https://dashboard.ngrok.com)
   Without ngrok you can still use the debug dashboard at http://localhost:5173
-  — iMessage replies via Sendblue won't work until your server is reachable.${C.reset}
+  — WhatsApp replies won't work until your server is reachable.${C.reset}
 `);
   }
 }
@@ -225,26 +216,8 @@ if (useNgrok && ngrokInstalled) {
 
 // Wait for all the core services to be ready before printing the banner,
 // so the URL isn't dangled in front of the user while Convex is still booting.
-async function autoRegisterWebhook(publicUrl) {
-  if (envVars.SENDBLUE_AUTO_WEBHOOK === "false") return;
-  const webhookUrl = `${publicUrl}/sendblue/webhook`;
-  const prefix = `${C.ngrok}webhook${C.reset} │ `;
-  const child = spawn("node", ["scripts/sendblue-webhook.mjs", webhookUrl], {
-    cwd: root,
-    env: { ...process.env },
-  });
-  child.stdout.on("data", (d) => {
-    for (const line of d.toString().split("\n")) {
-      if (line.trim()) process.stdout.write(prefix + line + "\n");
-    }
-  });
-  child.stderr.on("data", (d) => {
-    for (const line of d.toString().split("\n")) {
-      if (line.trim()) process.stdout.write(prefix + line + "\n");
-    }
-  });
-  await new Promise((r) => child.on("exit", r));
-}
+// WhatsApp (Meta Cloud API) webhooks are registered manually in the Meta Developer Console.
+// No auto-registration script needed.
 
 Promise.all([
   serverChild.ready,
@@ -255,11 +228,6 @@ Promise.all([
   .then(async ([, , , ngrokUrl]) => {
     if (useNgrok && ngrokInstalled) {
       if (ngrokUrl) {
-        // Only auto-register for ephemeral ngrok URLs. Reserved domains and
-        // static URLs are already fixed in the Sendblue dashboard.
-        if (!ngrokDomain) {
-          await autoRegisterWebhook(ngrokUrl);
-        }
         showBanner(ngrokUrl, Boolean(ngrokDomain));
       } else {
         console.log(
@@ -276,7 +244,7 @@ ${C.banner}${line}
 
   🐶 Debug dashboard:   http://localhost:5173
 
-  ⚠ No public tunnel configured. iMessage won't work until you expose
+  ⚠ No public tunnel configured. WhatsApp won't work until you expose
     the server. Use the Chat tab in the dashboard to test for now.
 ${line}${C.reset}
 `);

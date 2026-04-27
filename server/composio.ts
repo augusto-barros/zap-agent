@@ -1,6 +1,5 @@
-import { Composio } from "@composio/core";
-import { ClaudeAgentSDKProvider } from "@composio/claude-agent-sdk";
-import { createSdkMcpServer, type McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
+import { Composio, OpenAIProvider } from "@composio/core";
+import { createSdkMcpServer, type BoopTool, type ToolServer } from "./agent-runtime.js";
 import type { IntegrationModule } from "./integrations/registry.js";
 
 export type ToolkitAuthMode = "managed" | "byo";
@@ -47,15 +46,15 @@ export const CURATED_TOOLKITS: CuratedToolkit[] = [
 
 const DISPLAY_NAME_BY_SLUG = new Map(CURATED_TOOLKITS.map((t) => [t.slug, t.displayName]));
 
-let singleton: Composio<ClaudeAgentSDKProvider> | null = null;
+let singleton: Composio<OpenAIProvider> | null = null;
 
-export function getComposio(): Composio<ClaudeAgentSDKProvider> | null {
+export function getComposio(): Composio<OpenAIProvider> | null {
   if (singleton) return singleton;
   const apiKey = process.env.COMPOSIO_API_KEY;
   if (!apiKey) return null;
-  singleton = new Composio<ClaudeAgentSDKProvider>({
+  singleton = new Composio<OpenAIProvider>({
     apiKey,
-    provider: new ClaudeAgentSDKProvider(),
+    provider: new OpenAIProvider(),
   });
   return singleton;
 }
@@ -437,7 +436,7 @@ function extractAccountIdentity(state: unknown, data: unknown): AccountIdentity 
 export async function renameConnection(connectionId: string, alias: string): Promise<void> {
   const composio = getComposio();
   if (!composio) throw new Error("COMPOSIO_API_KEY not set");
-  await composio.connectedAccounts.update(connectionId, { alias });
+  await composio.connectedAccounts.update(connectionId, { alias } as unknown as Parameters<typeof composio.connectedAccounts.update>[1]);
 }
 
 export class ComposioNeedsAuthConfigError extends Error {
@@ -504,14 +503,11 @@ export function buildComposioIntegrationModule(slug: string): IntegrationModule 
     name: slug,
     description: `${displayNameFor(slug)} (via Composio)`,
     requiredEnv: ["COMPOSIO_API_KEY"],
-    createServer: async (): Promise<McpSdkServerConfigWithInstance> => {
+    createServer: async (): Promise<ToolServer> => {
       const composio = getComposio();
       if (!composio) {
         throw new Error(`[composio] cannot build ${slug} — COMPOSIO_API_KEY not set`);
       }
-      // If the user has 2+ active connections for this toolkit, force Composio to
-      // require explicit account selection per tool call — otherwise it silently
-      // picks the default account.
       const activeCount = (await listConnectedToolkits()).filter(
         (c) => c.slug === slug && c.status === "ACTIVE",
       ).length;
@@ -522,12 +518,28 @@ export function buildComposioIntegrationModule(slug: string): IntegrationModule 
           ? { multiAccount: { enable: true, requireExplicitSelection: true } }
           : {}),
       });
-      const tools = await session.tools();
-      return createSdkMcpServer({
-        name: slug,
-        version: "0.1.0",
-        tools,
-      });
+      // session.tools() returns OpenAI ChatCompletionTool[] with OpenAIProvider
+      const openaiTools = (await session.tools()) as Array<{
+        type: "function";
+        function: { name: string; description?: string; parameters?: Record<string, unknown> };
+      }>;
+      const boopTools: BoopTool[] = openaiTools.map((t) => ({
+        name: t.function.name,
+        description: t.function.description ?? "",
+        parameters: t.function.parameters ?? { type: "object", properties: {} },
+        handler: async (args: unknown) => {
+          const result = await composio.tools.execute(t.function.name, {
+            userId: boopUserId(),
+            arguments: args as Record<string, unknown>,
+            dangerouslySkipVersionCheck: true,
+          });
+          const text = result.successful
+            ? JSON.stringify(result.data ?? {})
+            : `Error: ${(result as { error?: string }).error ?? "unknown error"}`;
+          return { content: [{ type: "text" as const, text }] };
+        },
+      }));
+      return createSdkMcpServer({ name: slug, version: "0.1.0", tools: boopTools });
     },
   };
 }

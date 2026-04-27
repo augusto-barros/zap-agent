@@ -1,9 +1,28 @@
-import { query } from "@anthropic-ai/claude-agent-sdk";
+import OpenAI from "openai";
 import { api } from "../../convex/_generated/api.js";
 import { convex } from "../convex-client.js";
 import { embed } from "../embeddings.js";
-import { aggregateUsageFromResult, EMPTY_USAGE, type UsageTotals } from "../usage.js";
 import { SEGMENT_DEFAULTS, makeMemoryId, type MemorySegment } from "./types.js";
+
+const PRICING: Record<string, { input: number; output: number; cached: number }> = {
+  "gpt-4.1":      { input: 2.00,  output: 8.00,  cached: 0.50 },
+  "gpt-4.1-mini": { input: 0.40,  output: 1.60,  cached: 0.10 },
+  "gpt-4o":       { input: 2.50,  output: 10.00, cached: 1.25 },
+  "gpt-4o-mini":  { input: 0.15,  output: 0.60,  cached: 0.075 },
+};
+
+function calcCost(model: string, inp: number, out: number, cached: number): number {
+  const base = Object.keys(PRICING).find((k) => model.startsWith(k)) ?? model;
+  const p = PRICING[base];
+  if (!p) return 0;
+  return (Math.max(0, inp - cached) * p.input + out * p.output + cached * p.cached) / 1_000_000;
+}
+
+let _openai: OpenAI | null = null;
+function getOpenAI(): OpenAI {
+  if (!_openai) _openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  return _openai;
+}
 
 const EXTRACTION_PROMPT = `You are a memory-extraction subagent.
 
@@ -44,39 +63,35 @@ export async function extractAndStore(opts: {
   turnId: string;
 }): Promise<void> {
   const started = Date.now();
-  const requestedModel = process.env.BOOP_MODEL ?? "claude-sonnet-4-6";
+  const model = process.env.BOOP_CHEAP_MODEL ?? process.env.BOOP_MODEL ?? "gpt-4o-mini";
   try {
     const payload = `USER: ${opts.userMessage}\n\nASSISTANT: ${opts.assistantReply}`;
-    let buffer = "";
-    let usage: UsageTotals = { ...EMPTY_USAGE };
-    for await (const msg of query({
-      prompt: payload,
-      options: {
-        systemPrompt: EXTRACTION_PROMPT,
-        model: requestedModel,
-        permissionMode: "bypassPermissions",
-      },
-    })) {
-      if (msg.type === "assistant") {
-        for (const block of msg.message.content) {
-          if (block.type === "text") buffer += block.text;
-        }
-      } else if (msg.type === "result") {
-        usage = aggregateUsageFromResult(msg, requestedModel);
-      }
-    }
+    const resp = await getOpenAI().chat.completions.create({
+      model,
+      messages: [
+        { role: "system", content: EXTRACTION_PROMPT },
+        { role: "user", content: payload },
+      ],
+    });
+    const buffer = resp.choices[0]?.message?.content ?? "";
+    const inputTokens = resp.usage?.prompt_tokens ?? 0;
+    const outputTokens = resp.usage?.completion_tokens ?? 0;
+    const cached =
+      (resp.usage as { prompt_tokens_details?: { cached_tokens?: number } })
+        ?.prompt_tokens_details?.cached_tokens ?? 0;
+    const costUsd = calcCost(model, inputTokens, outputTokens, cached);
 
-    if (usage.costUsd > 0 || usage.inputTokens > 0) {
+    if (costUsd > 0 || inputTokens > 0) {
       await convex.mutation(api.usageRecords.record, {
         source: "extract",
         conversationId: opts.conversationId,
         turnId: opts.turnId,
-        model: usage.model,
-        inputTokens: usage.inputTokens,
-        outputTokens: usage.outputTokens,
-        cacheReadTokens: usage.cacheReadTokens,
-        cacheCreationTokens: usage.cacheCreationTokens,
-        costUsd: usage.costUsd,
+        model,
+        inputTokens,
+        outputTokens,
+        cacheReadTokens: cached,
+        cacheCreationTokens: 0,
+        costUsd,
         durationMs: Date.now() - started,
       });
     }

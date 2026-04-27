@@ -1,4 +1,4 @@
-import { query } from "@anthropic-ai/claude-agent-sdk";
+import { query } from "./agent-runtime.js";
 import { api } from "../convex/_generated/api.js";
 import { convex } from "./convex-client.js";
 import { broadcast } from "./broadcast.js";
@@ -37,7 +37,7 @@ output to the user verbatim, so if you don't include URLs, the user won't see
 any.
 
 Style:
-- Optimize for iMessage delivery: short sentences, bullets over paragraphs, no tables.
+- Optimize for WhatsApp delivery: short sentences, bullets over paragraphs, no tables.
 - Prefer markdown with **bold** keywords and • bullets.
 - Under 500 words unless explicitly asked for more.
 - If you can't complete something, say why in one sentence.
@@ -96,19 +96,12 @@ export async function spawnExecutionAgent(opts: SpawnOptions): Promise<SpawnResu
     ...integrationServers,
     ...(draftServer ? { "boop-drafts": draftServer } : {}),
   };
-  const allowedTools = [
-    "WebSearch",
-    "WebFetch",
-    "Skill",
-    ...Object.keys(mcpServers).flatMap((n) => [`mcp__${n}__*`]),
-  ];
-
   let buffer = "";
   let usage: UsageTotals = { ...EMPTY_USAGE };
   let status: "completed" | "failed" | "cancelled" = "completed";
   let errorMsg: string | undefined;
 
-  const requestedModel = process.env.BOOP_MODEL ?? "claude-sonnet-4-6";
+  const requestedModel = process.env.BOOP_MODEL ?? "gpt-4.1-mini";
   try {
     for await (const msg of query({
       prompt: opts.task,
@@ -116,11 +109,6 @@ export async function spawnExecutionAgent(opts: SpawnOptions): Promise<SpawnResu
         systemPrompt: EXECUTION_SYSTEM,
         model: requestedModel,
         mcpServers,
-        allowedTools,
-        // Load .claude/skills/ so the model can invoke SKILL.md playbooks. Without
-        // this the SDK runs in isolation mode and skills are silently ignored.
-        settingSources: ["project"],
-        permissionMode: "bypassPermissions",
         abortController: abort,
       },
     })) {
